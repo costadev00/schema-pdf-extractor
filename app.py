@@ -1,15 +1,17 @@
+import argparse
+import copy
+import hashlib
 import json
 import os
-import time
+import sys
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+import gradio as gr
 import pdfplumber
 from dotenv import load_dotenv
 from openai import OpenAI
-from rapidfuzz import fuzz
-import gradio as gr
-import re
 
 load_dotenv()
 
@@ -17,351 +19,317 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
-def pdf_to_lines(pdf_bytes: bytes) -> List[str]:
-    lines: List[str] = []
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                for line in text.splitlines():
-                    line = line.strip()
-                    if line:
-                        lines.append(line)
-    return lines
+CACHE: Dict[str, Dict[str, Any]] = {}
 
-ANCHORS: Dict[str, List[str]] = {
-    "nome": ["nome", "nome do profissional", "profissional", "titular"],
-    "inscricao": ["inscrição", "inscricao", "nº inscrição", "registro", "número"],
-    "seccional": ["seccional", "uf", "seção", "secção", "estado"],
-    "cpf": ["cpf", "documento", "cpf do titular"],
-    "oab": ["oab", "carteira oab", "nº oab"],
+
+DEFAULT_SCHEMA: Dict[str, str] = {
+	"nome": "Nome do profissional, normalmente no canto superior esquerdo da imagem",
+	"inscricao": "Número de inscrição do profissional",
+	"seccional": "Seccional do profissional",
+	"subsecao": "Subseção à qual o profissional faz parte",
+	"categoria": "Categoria, pode ser ADVOGADO, ADVOGADA, SUPLEMENTAR, ESTAGIARIO, ESTAGIARIA",
+	"endereco_profissional": "Endereço profissional completo",
+	"situacao": "Situação do profissional, normalmente no canto inferior direito.",
 }
 
-REGEX_PATTERNS: Dict[str, re.Pattern[str]] = {
-    "cpf": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
-    "cep": re.compile(r"\b\d{5}-?\d{3}\b"),
-    "inscricao": re.compile(r"\b\d{3,6}\b"),
-    "oab": re.compile(r"\b\d{3,6}\b"),
-}
-
-UF_SET = {
-    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS",
-    "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC",
-    "SP", "SE", "TO",
-}
+PROMPT_TEMPLATE = (
+	"Extrai os dados desse arquivo no seguinte formato: Caso não encontrar o campo, "
+	"adicione null. Retorne somente o arquivo json {schema_json}\n\n"
+	"Texto do documento:\n{document_text}"
+)
 
 
-def normalize_cpf(value: str) -> Optional[str]:
-    digits = re.sub(r"\D", "", value or "")
-    if len(digits) != 11 or len(set(digits)) == 1:
-        return None
-
-    def calc_digit(v: str) -> int:
-        factor = len(v) + 1
-        total = sum(int(num) * (factor - idx) for idx, num in enumerate(v))
-        remainder = (total * 10) % 11
-        return remainder if remainder < 10 else 0
-
-    first = calc_digit(digits[:9])
-    second = calc_digit(digits[:9] + str(first))
-    if digits[-2:] != f"{first}{second}":
-        return None
-    return f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
-
-
-def normalize_cep(value: str) -> Optional[str]:
-    digits = re.sub(r"\D", "", value or "")
-    if len(digits) != 8:
-        return None
-    return f"{digits[:5]}-{digits[5:]}"
+def pdf_to_text(pdf_bytes: bytes) -> Tuple[str, Optional[str]]:
+	lines: List[str] = []
+	try:
+		with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+			for page in pdf.pages:
+				text = page.extract_text() or ""
+				for raw_line in text.splitlines():
+					line = raw_line.strip()
+					if line:
+						lines.append(line)
+	except Exception as exc:  # noqa: BLE001
+		return "", f"Erro ao processar PDF: {exc}"
+	if not lines:
+		return "", "Nenhum texto extraído do PDF."
+	return "\n".join(lines), None
 
 
-def normalize_uf(value: str) -> Optional[str]:
-    if not value:
-        return None
-    code = value.strip().upper()
-    if code in UF_SET:
-        return code
-    return None
+def read_pdf_bytes(pdf_input: Any) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+	potential_paths: List[str] = []
+	display_name: Optional[str] = None
+
+	if isinstance(pdf_input, dict):
+		for key in ("path", "name"):
+			value = pdf_input.get(key)
+			if isinstance(value, str):
+				potential_paths.append(value)
+		display_name = pdf_input.get("name") if isinstance(pdf_input.get("name"), str) else None
+
+	if hasattr(pdf_input, "name") and isinstance(pdf_input.name, str):
+		potential_paths.append(pdf_input.name)
+		display_name = pdf_input.name
+
+	if isinstance(pdf_input, str):
+		potential_paths.append(pdf_input)
+		display_name = pdf_input
+
+	for path in potential_paths:
+		if os.path.exists(path):
+			try:
+				with open(path, "rb") as handle:
+					return handle.read(), display_name or os.path.basename(path), None
+			except Exception as exc:  # noqa: BLE001
+				return None, display_name or path, f"Erro ao ler PDF: {exc}"
+
+	if hasattr(pdf_input, "read"):
+		try:
+			data = pdf_input.read()
+			if isinstance(data, bytes):
+				return data, display_name or "arquivo.pdf", None
+		except Exception as exc:  # noqa: BLE001
+			return None, display_name or "arquivo.pdf", f"Erro ao ler PDF: {exc}"
+
+	return None, display_name or "arquivo.pdf", "Não foi possível acessar os bytes do PDF enviado."
 
 
-def normalize_value(field: str, value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        value = str(value)
-    value = str(value).strip()
-    if not value:
-        return None
-    field_lower = field.lower()
-    if field_lower == "cpf":
-        return normalize_cpf(value)
-    if field_lower == "cep":
-        return normalize_cep(value)
-    if field_lower in {"uf", "seccional"}:
-        return normalize_uf(value)
-    return value
-
-def build_anchor_set(field: str, description: str) -> List[str]:
-    base = set(ANCHORS.get(field.lower(), []))
-    base.add(field.lower())
-    if description:
-        desc_tokens = [description.lower()]
-        desc_tokens.extend(description.lower().split())
-        base.update(token for token in desc_tokens if token)
-    return [token for token in base if token]
+def compute_cache_key(schema_signature: str, pdf_bytes: bytes) -> str:
+	schema_hash = hashlib.sha256(schema_signature.encode("utf-8")).hexdigest()
+	pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
+	return f"{schema_hash}|{pdf_hash}"
 
 
-def guess_field(lines: List[str], field: str, description: str) -> Tuple[Optional[str], float, Optional[int]]:
-    field_lower = field.lower()
-    regex = REGEX_PATTERNS.get(field_lower)
-    if regex:
-        for idx, line in enumerate(lines):
-            match = regex.search(line)
-            if match:
-                value = match.group(0).strip()
-                return value, 0.9, idx
-    anchors = build_anchor_set(field, description)
-    best_score = 0.0
-    best_idx: Optional[int] = None
-    for idx, raw_line in enumerate(lines):
-        line = raw_line.lower()
-        for anchor in anchors:
-            score = fuzz.partial_ratio(anchor, line)
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-    if best_idx is None or best_score <= 0:
-        return None, 0.0, None
-    candidate_value: Optional[str] = None
-    target_line = lines[best_idx]
-    if ":" in target_line:
-        after = target_line.split(":", 1)[1].strip()
-        if after:
-            candidate_value = after
-    if not candidate_value:
-        next_idx = best_idx + 1
-        if next_idx < len(lines):
-            candidate_value = lines[next_idx].strip()
-    confidence = best_score / 100
-    if regex and candidate_value:
-        regex_match = regex.search(candidate_value)
-        if regex_match:
-            candidate_value = regex_match.group(0).strip()
-            confidence = max(confidence, 0.9)
-    return candidate_value, confidence, best_idx
+def parse_schema(schema_text: str) -> Tuple[Optional[Dict[str, str]], Optional[str], Optional[str]]:
+	trimmed = schema_text.strip() if schema_text else ""
+	if not trimmed:
+		schema_map = DEFAULT_SCHEMA.copy()
+		schema_json = json.dumps(schema_map, ensure_ascii=False, indent=2, sort_keys=True)
+		return schema_map, schema_json, None
+
+	try:
+		raw = json.loads(trimmed)
+	except Exception as exc:  # noqa: BLE001
+		return None, None, f"Schema inválido: {exc}"
+	if not isinstance(raw, dict):
+		return None, None, "Schema deve ser um objeto JSON."
+	schema_map: Dict[str, str] = {}
+	for key, value in raw.items():
+		if not isinstance(key, str):
+			return None, None, "Todas as chaves do schema devem ser strings."
+		schema_map[key] = value if isinstance(value, str) else str(value)
+	schema_json = json.dumps(schema_map, ensure_ascii=False, indent=2, sort_keys=True)
+	return schema_map, schema_json, None
 
 
-def heuristic_extract(
-    lines: List[str],
-    schema_map: Dict[str, str],
-    conf_threshold: float,
-) -> Tuple[Dict[str, Optional[str]], Dict[str, float], Dict[str, Optional[int]], List[str]]:
-    partial: Dict[str, Optional[str]] = {}
-    confidences: Dict[str, float] = {}
-    positions: Dict[str, Optional[int]] = {}
-    missing: List[str] = []
-    for field, description in schema_map.items():
-        value, confidence, idx = guess_field(lines, field, description or "")
-        partial[field] = value
-        confidences[field] = confidence
-        positions[field] = idx
-        if value is None or confidence < conf_threshold:
-            missing.append(field)
-    return partial, confidences, positions, missing
+def call_llm(
+	document_text: str,
+	schema_map: Dict[str, str],
+	schema_json: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+	if client is None:
+		return None, "OPENAI_API_KEY não configurada no ambiente."
+	prompt = PROMPT_TEMPLATE.format(schema_json=schema_json, document_text=document_text)
+	try:
+		response = client.chat.completions.create(
+			model="gpt-5-mini",
+			messages=[
+				{
+					"role": "system",
+					"content": "Você é um assistente que extrai dados estruturados e responde apenas em JSON válido.",
+				},
+				{"role": "user", "content": prompt},
+			],
+			response_format={"type": "json_object"},
+		)
+	except Exception as exc:  # noqa: BLE001
+		return None, f"Falha na chamada ao modelo: {exc}"
+
+	content = response.choices[0].message.content
+	try:
+		data = json.loads(content)
+	except Exception as exc:  # noqa: BLE001
+		return None, f"Resposta do modelo não pôde ser convertida em JSON: {exc}"
+	cleaned: Dict[str, Any] = {}
+	for key in schema_map:
+		cleaned[key] = data.get(key)
+	return cleaned, None
 
 
-def build_excerpts(
-    lines: List[str],
-    positions: Dict[str, Optional[int]],
-    targets: List[str],
-    radius: int = 2,
-) -> Dict[str, str]:
-    excerpts: Dict[str, str] = {}
-    default_excerpt = "\n".join(lines[: min(len(lines), 10)])
-    for field in targets:
-        idx = positions.get(field)
-        if idx is None:
-            excerpts[field] = default_excerpt
-        else:
-            start = max(0, idx - radius)
-            end = min(len(lines), idx + radius + 1)
-            excerpts[field] = "\n".join(lines[start:end])
-    return excerpts
+def process_pdf(
+	pdf_input: Any,
+	schema_map: Dict[str, str],
+	schema_json: str,
+) -> Tuple[str, Optional[Dict[str, Any]], str]:
+	pdf_bytes, display_name, error = read_pdf_bytes(pdf_input)
+	if pdf_bytes is None:
+		return display_name or "arquivo.pdf", None, error or "Erro desconhecido ao ler PDF."
 
-def llm_fill_missing_gpt5mini(
-    schema_subset: Dict[str, str],
-    excerpts: Dict[str, str],
-) -> Dict[str, Optional[str]]:
-    if not schema_subset or client is None:
-        return {}
-    system_message = (
-        "Você é um assistente que extrai campos estruturados de documentos. "
-        "Responda apenas em JSON válido, com exatamente as chaves solicitadas. "
-        "Use apenas as informações fornecidas nos trechos. Se um dado estiver ausente, "
-        "ambíguo ou inválido, retorne null."
-    )
-    schema_lines = [
-        f"- {key}: {schema_subset[key]}" for key in schema_subset
-    ]
-    context_parts = []
-    for key, excerpt in excerpts.items():
-        context_parts.append(f"Campo: {key}\n{excerpt}")
-    user_message = (
-        "Campos solicitados:\n"
-        + "\n".join(schema_lines)
-        + "\n\nTrechos relevantes:\n"
-        + "\n---\n".join(context_parts)
-        + "\n\nForneça JSON estrito com exatamente essas chaves."
-    )
-    try:
-        response = client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
-        )
-    except Exception:
-        return {}
-    content = response.choices[0].message.content
-    try:
-        data = json.loads(content)
-    except Exception:
-        return {}
-    cleaned: Dict[str, Optional[str]] = {}
-    for key in schema_subset:
-        cleaned[key] = data.get(key)
-    return cleaned
+	cache_key = compute_cache_key(schema_json, pdf_bytes)
+	if cache_key in CACHE:
+		cached_data = CACHE[cache_key].get("data")
+		return display_name or "arquivo.pdf", copy.deepcopy(cached_data), "cache"
 
-def run_pipeline(
-    pdf_file: Optional[gr.File],
-    label: str,
-    schema_text: str,
-    conf_threshold: float,
-    allow_llm: bool,
-) -> Tuple[str, str]:
-    start_time = time.perf_counter()
-    if pdf_file is None:
-        return json.dumps({}, ensure_ascii=False, indent=2), "Nenhum PDF fornecido."
-    try:
-        schema_map = json.loads(schema_text or "{}")
-        if not isinstance(schema_map, dict):
-            raise ValueError("Schema deve ser um objeto JSON.")
-    except Exception as exc:
-        return json.dumps({}, ensure_ascii=False, indent=2), f"Schema inválido: {exc}"
+	document_text, text_error = pdf_to_text(pdf_bytes)
+	if text_error is not None:
+		return display_name or "arquivo.pdf", None, text_error
 
-    try:
-        pdf_bytes = pdf_file.read()
-    except Exception as exc:
-        return json.dumps({}, ensure_ascii=False, indent=2), f"Erro ao ler PDF: {exc}"
+	llm_result, llm_error = call_llm(document_text, schema_map, schema_json)
+	if llm_error is not None:
+		return display_name or "arquivo.pdf", None, llm_error
 
-    lines = pdf_to_lines(pdf_bytes)
-    if not lines:
-        return json.dumps({}, ensure_ascii=False, indent=2), "PDF sem texto extraído."
+	CACHE[cache_key] = {"data": copy.deepcopy(llm_result)}
+	return display_name or "arquivo.pdf", llm_result, "ok"
 
-    heuristics, confidences, positions, initial_missing = heuristic_extract(
-        lines, schema_map, conf_threshold
-    )
 
-    normalized: Dict[str, Optional[str]] = {}
-    llm_targets: List[str] = []
-    for field in schema_map:
-        value = heuristics.get(field)
-        normalized_value = normalize_value(field, value)
-        normalized[field] = normalized_value if normalized_value is not None else None
-        if normalized[field] is None or confidences.get(field, 0.0) < conf_threshold:
-            llm_targets.append(field)
+def process_batch(
+	pdf_inputs: Optional[List[Any]],
+	schema_map: Dict[str, str],
+	schema_json: str,
+) -> Tuple[List[Dict[str, Any]], str]:
+	if not pdf_inputs:
+		return [], "Nenhum PDF fornecido."
 
-    llm_results: Dict[str, Optional[str]] = {}
-    llm_used = False
-    if allow_llm and llm_targets:
-        excerpts = build_excerpts(lines, positions, llm_targets)
-        schema_subset = {field: schema_map[field] for field in llm_targets}
-        llm_results = llm_fill_missing_gpt5mini(schema_subset, excerpts)
-        llm_used = bool(llm_results)
+	results: List[Dict[str, Any]] = []
+	logs: List[str] = []
 
-    final_data: Dict[str, Optional[str]] = {}
-    for field in schema_map:
-        value = normalized.get(field)
-        if field in llm_results:
-            llm_value = normalize_value(field, llm_results[field])
-            if llm_value is not None or value is None:
-                value = llm_value
-        final_data[field] = value
+	for pdf_input in pdf_inputs:
+		name, data, status = process_pdf(pdf_input, schema_map, schema_json)
+		record = {
+			"arquivo": str(name),
+			"dados": data,
+			"status": status,
+		}
+		results.append(record)
+		logs.append(f"{name}: {status}")
 
-    final_missing = [key for key, value in final_data.items() if value is None]
+	filtered_results = [entry.get("dados") for entry in results]
 
-    elapsed = time.perf_counter() - start_time
-    log_lines = [
-        f"Label: {label}",
-        f"Campos no schema: {', '.join(schema_map.keys())}",
-        f"Campos faltantes após heurística: {', '.join(initial_missing) if initial_missing else 'nenhum'}",
-        f"Confidências heurísticas: "
-        + ", ".join(
-            f"{field}={confidences.get(field, 0.0):.2f}" for field in schema_map
-        ),
-        f"LLM habilitado: {'sim' if allow_llm else 'não'}",
-        f"LLM acionado: {'sim' if llm_targets else 'não'}",
-        f"LLM retornou dados: {'sim' if llm_used else 'não'}",
-        f"Campos finais ausentes/invalidos: {', '.join(final_missing) if final_missing else 'nenhum'}",
-        f"Tempo total: {elapsed:.2f}s",
-    ]
+	return filtered_results, "\n".join(logs)
 
-    json_output = json.dumps(final_data, ensure_ascii=False, indent=2)
-    log_text = "\n".join(log_lines)
-    return json_output, log_text
+
+def run_cli(pdf_dir: str, schema_text: Optional[str]) -> int:
+	schema_map, schema_json, schema_error = parse_schema(schema_text or "")
+	if schema_error is not None:
+		print(f"Erro no schema: {schema_error}", file=sys.stderr)
+		return 1
+
+	directory = Path(pdf_dir)
+	if not directory.exists() or not directory.is_dir():
+		print(f"Diretório inválido: {pdf_dir}", file=sys.stderr)
+		return 1
+
+	pdf_files = sorted(path for path in directory.glob("*.pdf") if path.is_file())
+	if not pdf_files:
+		print(f"Nenhum arquivo .pdf encontrado em {pdf_dir}", file=sys.stderr)
+		return 1
+
+	outputs: List[Dict[str, Any]] = []
+	logs: List[str] = []
+
+	for pdf_path in pdf_files:
+		name, data, status = process_pdf(str(pdf_path), schema_map, schema_json)
+		outputs.append(
+			{
+				"arquivo": str(pdf_path),
+				"dados": data,
+				"status": status,
+			}
+		)
+		logs.append(f"{pdf_path.name}: {status}")
+
+	print(json.dumps(outputs, ensure_ascii=False, indent=2))
+	if logs:
+		print("\n".join(logs), file=sys.stderr)
+
+	return 0
+
 
 def build_interface() -> gr.Blocks:
-    default_schema = json.dumps(
-        {
-            "nome": "Nome do profissional.",
-            "inscricao": "Número de inscrição/registro.",
-            "seccional": "Seccional/UF (ex: PR, SP).",
-            "cpf": "CPF do titular (se constar).",
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
+	schema_default = json.dumps(DEFAULT_SCHEMA, ensure_ascii=False, indent=2, sort_keys=True)
+	with gr.Blocks(title="Extrator PDF → JSON") as demo:
+		gr.Markdown("## Extrator PDF → JSON")
+		gr.Markdown(
+			"Envie um ou mais PDFs e informe o schema que deve ser utilizado na extração."
+		)
 
-    with gr.Blocks(title="Extrator PDF → JSON orientado por schema") as demo:
-        gr.Markdown("## Extrator PDF → JSON orientado por schema")
-        with gr.Row():
-            pdf_input = gr.File(label="PDF (1 página, texto embutido)", file_types=[".pdf"])
-            label_input = gr.Textbox(label="Label", placeholder="Identificador livre")
-        schema_input = gr.Code(
-            label="Schema de extração (JSON)",
-            value=default_schema,
-            language="json",
-            lines=12,
-        )
-        with gr.Row():
-            threshold_input = gr.Slider(
-                minimum=0.5,
-                maximum=0.95,
-                value=0.70,
-                step=0.01,
-                label="Limiar de confiança heurística",
-            )
-            llm_checkbox = gr.Checkbox(label="Usar fallback LLM", value=True)
-        extract_button = gr.Button("Extrair")
-        json_output = gr.JSON(label="Resultado JSON")
-        log_output = gr.Textbox(label="Log", lines=12)
+		pdf_input = gr.File(
+			label="PDFs",
+			file_types=[".pdf"],
+			file_count="multiple",
+		)
 
-        def on_extract(pdf_file, label_value, schema_text, threshold, allow_llm):
-            return run_pipeline(pdf_file, label_value or "", schema_text, float(threshold), bool(allow_llm))
+		schema_input = gr.Code(
+			label="Schema (JSON)",
+			value=schema_default,
+			language="json",
+			lines=12,
+		)
 
-        extract_button.click(
-            fn=on_extract,
-            inputs=[pdf_input, label_input, schema_input, threshold_input, llm_checkbox],
-            outputs=[json_output, log_output],
-        )
+		extract_button = gr.Button("Extrair")
+		json_output = gr.JSON(label="Resultados (por arquivo)")
+		log_output = gr.Textbox(label="Log", lines=10)
 
-    return demo
+		def on_extract(files: List[Any], schema_text: str):
+			schema_map, schema_json, schema_error = parse_schema(schema_text)
+			if schema_error is not None:
+				return [], schema_error
+			return process_batch(files, schema_map, schema_json)
+
+		extract_button.click(
+			fn=on_extract,
+			inputs=[pdf_input, schema_input],
+			outputs=[json_output, log_output],
+		)
+
+	return demo
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+	parser = argparse.ArgumentParser(description="Extrator PDF → JSON orientado por schema")
+	parser.add_argument(
+		"--cli",
+		action="store_true",
+		help="Executa em modo linha de comando processando todos os PDFs de uma pasta.",
+	)
+	parser.add_argument(
+		"--pdf-dir",
+		type=str,
+		help="Caminho da pasta que contém arquivos PDF (obrigatório no modo CLI).",
+	)
+	parser.add_argument(
+		"--schema-file",
+		type=str,
+		help="Arquivo JSON com o schema a ser utilizado (opcional).",
+	)
+	parser.add_argument(
+		"--schema",
+		type=str,
+		help="Schema em JSON fornecido diretamente na linha de comando (sobrepõe --schema-file).",
+	)
+
+	args = parser.parse_args(argv)
+
+	if args.cli:
+		if not args.pdf_dir:
+			parser.error("--pdf-dir é obrigatório quando --cli é utilizado.")
+
+		schema_text: Optional[str] = None
+		if args.schema_file:
+			try:
+				schema_text = Path(args.schema_file).read_text(encoding="utf-8")
+			except Exception as exc:  # noqa: BLE001
+				print(f"Erro ao ler schema: {exc}", file=sys.stderr)
+				return 1
+		if args.schema is not None:
+			schema_text = args.schema
+
+		return run_cli(args.pdf_dir, schema_text)
+
+	interface = build_interface()
+	interface.launch()
+	return 0
 
 
 if __name__ == "__main__":
-    interface = build_interface()
-    interface.launch()
+	sys.exit(main())
