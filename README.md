@@ -5,7 +5,7 @@ Uma aplicação que combina heurísticas simples e chamadas a modelos de linguag
 ## Visão Geral
 
 - **Extração padronizada**: um schema JSON descreve os campos esperados e o modelo de linguagem retorna apenas esses campos (ou `null`).
-- **Upload em lote**: a UI aceita múltiplos PDFs em uma única execução.
+- **Upload em lote**: a UI aceita múltiplos PDFs em uma única execução, exigindo um label identificador para cada extração.
 - **CLI em lote**: o modo de linha de comando varre uma pasta e processa todos os PDFs encontrados.
 - **Cache inteligente**: PDFs já processados com o mesmo schema voltam instantaneamente, poupando chamadas ao modelo.
 - **Prompt consistente**: poucos-shot examples embutidos demonstram o formato esperado, reduzindo erros de mapeamento.
@@ -30,22 +30,24 @@ python app.py
 
 Isso abrirá (ou exibirá no terminal) a URL local da interface. Na UI:
 
-1. Informe o schema JSON (um valor padrão é carregado). Apenas campos presentes no schema serão retornados.
-2. Selecione um ou mais arquivos PDF.
-3. Clique em **Extrair**. O painel de JSON mostrará apenas os campos `dados` (um objeto por arquivo). O log indica se o resultado veio do cache ou do modelo.
+1. Informe um **label** descritivo para o lote (ex.: `carteira_oab`).
+2. Ajuste o schema JSON se necessário (um valor padrão é carregado). Apenas campos presentes no schema serão retornados.
+3. Selecione um ou mais arquivos PDF.
+4. Clique em **Extrair**. O painel de JSON mostrará apenas os campos `dados` (um objeto por arquivo). O log indica se o resultado veio do cache ou do modelo.
 
 ## Utilizando o Modo CLI
 
 É possível processar lotes diretamente pela linha de comando, apontando para uma pasta com PDFs:
 
 ```bash
-python app.py --cli --pdf-dir "caminho/para/pasta" --schema-file schema.json
+python app.py --cli --pdf-dir "caminho/para/pasta" --label carteira_oab --schema-file schema.json
 ```
 
 Opções principais:
 
 - `--cli`: ativa o modo CLI.
 - `--pdf-dir`: diretório contendo arquivos `.pdf` (obrigatório no modo CLI).
+- `--label`: identificador aplicado ao lote processado (obrigatório no modo CLI).
 - `--schema-file`: caminho para um arquivo JSON com o schema desejado (opcional).
 - `--schema`: string JSON inline que sobrepõe o arquivo, útil para scripts automáticos.
 
@@ -75,7 +77,7 @@ Saída:
 
 ## Estrutura do Projeto
 
-```
+```text
 app.py             # Aplicação e CLI
 requirements.txt   # Dependências Python
 ```

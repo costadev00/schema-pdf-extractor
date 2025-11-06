@@ -156,6 +156,45 @@ def call_llm(
 	return cleaned, None
 
 
+def build_relevant_context(
+	document_text: str,
+	schema_map: Dict[str, str],
+	max_chars: int = 4000,
+	max_lines: int = 200,
+) -> Tuple[str, bool]:
+	if len(document_text) <= max_chars:
+		return document_text, False
+
+	lines = [line.strip() for line in document_text.splitlines() if line.strip()]
+	if not lines:
+		return document_text[:max_chars], True
+
+	keywords: List[str] = []
+	for key, description in schema_map.items():
+		keywords.append(key.lower())
+		if isinstance(description, str):
+			keywords.extend(token for token in description.lower().split() if len(token) > 3)
+
+	relevant: List[str] = []
+	seen: set[str] = set()
+	for line in lines:
+		lower = line.lower()
+		if any(keyword in lower for keyword in keywords):
+			if line not in seen:
+				relevant.append(line)
+				seen.add(line)
+		if len(relevant) >= max_lines:
+			break
+
+	if not relevant:
+		relevant = lines[:max_lines]
+
+	snippet = "\n".join(relevant)
+	if len(snippet) > max_chars:
+		snippet = snippet[:max_chars]
+	return snippet, True
+
+
 def process_pdf(
 	pdf_input: Any,
 	schema_map: Dict[str, str],
@@ -174,18 +213,21 @@ def process_pdf(
 	if text_error is not None:
 		return display_name or "arquivo.pdf", None, text_error
 
-	llm_result, llm_error = call_llm(document_text, schema_map, schema_json)
+	reduced_text, truncated = build_relevant_context(document_text, schema_map)
+	llm_result, llm_error = call_llm(reduced_text, schema_map, schema_json)
 	if llm_error is not None:
 		return display_name or "arquivo.pdf", None, llm_error
 
 	CACHE[cache_key] = {"data": copy.deepcopy(llm_result)}
-	return display_name or "arquivo.pdf", llm_result, "ok"
+	status = "ok" if not truncated else "ok (contexto reduzido)"
+	return display_name or "arquivo.pdf", llm_result, status
 
 
 def process_batch(
 	pdf_inputs: Optional[List[Any]],
 	schema_map: Dict[str, str],
 	schema_json: str,
+	label: str,
 ) -> Tuple[List[Dict[str, Any]], str]:
 	if not pdf_inputs:
 		return [], "Nenhum PDF fornecido."
@@ -196,19 +238,23 @@ def process_batch(
 	for pdf_input in pdf_inputs:
 		name, data, status = process_pdf(pdf_input, schema_map, schema_json)
 		record = {
+			"label": label or "",
 			"arquivo": str(name),
 			"dados": data,
 			"status": status,
 		}
 		results.append(record)
-		logs.append(f"{name}: {status}")
+		if label:
+			logs.append(f"{label}:{name}: {status}")
+		else:
+			logs.append(f"{name}: {status}")
 
 	filtered_results = [entry.get("dados") for entry in results]
 
 	return filtered_results, "\n".join(logs)
 
 
-def run_cli(pdf_dir: str, schema_text: Optional[str]) -> int:
+def run_cli(pdf_dir: str, label: str, schema_text: Optional[str]) -> int:
 	schema_map, schema_json, schema_error = parse_schema(schema_text or "")
 	if schema_error is not None:
 		print(f"Erro no schema: {schema_error}", file=sys.stderr)
@@ -231,12 +277,16 @@ def run_cli(pdf_dir: str, schema_text: Optional[str]) -> int:
 		name, data, status = process_pdf(str(pdf_path), schema_map, schema_json)
 		outputs.append(
 			{
+				"label": label,
 				"arquivo": str(pdf_path),
 				"dados": data,
 				"status": status,
 			}
 		)
-		logs.append(f"{pdf_path.name}: {status}")
+		if label:
+			logs.append(f"{label}:{pdf_path.name}: {status}")
+		else:
+			logs.append(f"{pdf_path.name}: {status}")
 
 	print(json.dumps(outputs, ensure_ascii=False, indent=2))
 	if logs:
@@ -250,7 +300,7 @@ def build_interface() -> gr.Blocks:
 	with gr.Blocks(title="Extrator PDF → JSON") as demo:
 		gr.Markdown("## Extrator PDF → JSON")
 		gr.Markdown(
-			"Envie um ou mais PDFs e informe o schema que deve ser utilizado na extração."
+			"Envie um ou mais PDFs, informe o label identificador e defina o schema que deve ser utilizado na extração."
 		)
 
 		pdf_input = gr.File(
@@ -259,26 +309,30 @@ def build_interface() -> gr.Blocks:
 			file_count="multiple",
 		)
 
-		schema_input = gr.Code(
-			label="Schema (JSON)",
-			value=schema_default,
-			language="json",
-			lines=12,
-		)
+		with gr.Row():
+			label_input = gr.Textbox(label="Label", placeholder="carteira_oab")
+			schema_input = gr.Code(
+				label="Schema (JSON)",
+				value=schema_default,
+				language="json",
+				lines=12,
+			)
 
 		extract_button = gr.Button("Extrair")
 		json_output = gr.JSON(label="Resultados (por arquivo)")
 		log_output = gr.Textbox(label="Log", lines=10)
 
-		def on_extract(files: List[Any], schema_text: str):
+		def on_extract(files: List[Any], label_value: str, schema_text: str):
+			if not label_value or not label_value.strip():
+				return [], "Label é obrigatório."
 			schema_map, schema_json, schema_error = parse_schema(schema_text)
 			if schema_error is not None:
 				return [], schema_error
-			return process_batch(files, schema_map, schema_json)
+			return process_batch(files, schema_map, schema_json, label_value.strip())
 
 		extract_button.click(
 			fn=on_extract,
-			inputs=[pdf_input, schema_input],
+			inputs=[pdf_input, label_input, schema_input],
 			outputs=[json_output, log_output],
 		)
 
@@ -298,6 +352,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 		help="Caminho da pasta que contém arquivos PDF (obrigatório no modo CLI).",
 	)
 	parser.add_argument(
+		"--label",
+		type=str,
+		help="Label identificador aplicado aos resultados (obrigatório no modo CLI).",
+	)
+	parser.add_argument(
 		"--schema-file",
 		type=str,
 		help="Arquivo JSON com o schema a ser utilizado (opcional).",
@@ -313,6 +372,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 	if args.cli:
 		if not args.pdf_dir:
 			parser.error("--pdf-dir é obrigatório quando --cli é utilizado.")
+		if not args.label:
+			parser.error("--label é obrigatório quando --cli é utilizado.")
 
 		schema_text: Optional[str] = None
 		if args.schema_file:
@@ -324,7 +385,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 		if args.schema is not None:
 			schema_text = args.schema
 
-		return run_cli(args.pdf_dir, schema_text)
+		return run_cli(args.pdf_dir, args.label, schema_text)
 
 	interface = build_interface()
 	interface.launch()
